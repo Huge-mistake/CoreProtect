@@ -68,6 +68,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     private DuckDBSpatialIndex.Transaction duckDBSpatialIndex;
     private EntitySpawnStatement.Updates entitySpawnUpdates;
     private boolean commitAttempted;
+    private Throwable commitFailure;
 
     public RelationalConsumerWriteBatch(Connection connection, DatabaseType databaseType) throws SQLException {
         this.connection = Objects.requireNonNull(connection, "connection");
@@ -77,6 +78,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
 
     @Override
     public void begin() throws Exception {
+        clearProcessedEntityRemovals();
         commitAttempted = false;
         if (databaseType.isDuckDB()) {
             duckDBSpatialIndex = DuckDBSpatialIndex.begin(connection, ConfigHandler.prefix);
@@ -86,7 +88,9 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
 
     @Override
     public boolean commit() throws Exception {
+        clearProcessedEntityRemovals();
         commitAttempted = false;
+        commitFailure = null;
         try {
             finishDuckDBBlockAppender();
             boolean acknowledgedRollback = Database.isRollbackOnlyTransactionAcknowledged();
@@ -103,8 +107,17 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
             boolean committed = Database.commitTransactionChecked(transactionStatement, databaseType, () -> commitAttempted = true);
             if (!committed) {
                 boolean rolledBack = Database.rollbackTransaction(transactionStatement, databaseType);
-                duckDBSpatialIndex = null;
+                if (commitAttempted || !rolledBack) {
+                    abandonDuckDBSpatialIndex();
+                }
+                else {
+                    duckDBSpatialIndex = null;
+                }
                 return acknowledgedRollback && rolledBack;
+            }
+            if (acknowledgedRollback) {
+                duckDBSpatialIndex = null;
+                return true;
             }
             if (duckDBSpatialIndex != null) {
                 duckDBSpatialIndex.publish();
@@ -113,9 +126,15 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
             return true;
         }
         catch (Exception exception) {
+            commitFailure = exception;
             Database.reportDatabaseFailure(exception);
-            Database.rollbackTransaction(transactionStatement, databaseType);
-            duckDBSpatialIndex = null;
+            boolean rolledBack = Database.rollbackTransaction(transactionStatement, databaseType);
+            if (commitAttempted || !rolledBack) {
+                abandonDuckDBSpatialIndex();
+            }
+            else {
+                duckDBSpatialIndex = null;
+            }
             return false;
         }
     }
@@ -126,15 +145,33 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     }
 
     @Override
+    public Throwable getCommitFailure() {
+        return commitFailure;
+    }
+
+    @Override
     public void rollback() {
+        clearProcessedEntityRemovals();
         try {
             finishDuckDBBlockAppender();
         }
         catch (Exception exception) {
             Database.reportDatabaseFailure(exception);
         }
-        Database.rollbackTransaction(transactionStatement, databaseType);
-        duckDBSpatialIndex = null;
+        boolean rolledBack = Database.rollbackTransaction(transactionStatement, databaseType);
+        if (!rolledBack) {
+            abandonDuckDBSpatialIndex();
+        }
+        else {
+            duckDBSpatialIndex = null;
+        }
+    }
+
+    private void abandonDuckDBSpatialIndex() {
+        if (duckDBSpatialIndex != null) {
+            duckDBSpatialIndex.abandon();
+            duckDBSpatialIndex = null;
+        }
     }
 
     @Override
@@ -561,6 +598,12 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
             entitySpawnUpdates = new EntitySpawnStatement.Updates(connection, this, databaseType);
         }
         return entitySpawnUpdates;
+    }
+
+    private void clearProcessedEntityRemovals() {
+        if (entitySpawnUpdates != null) {
+            entitySpawnUpdates.clearProcessedRemovals();
+        }
     }
 
     @Override
